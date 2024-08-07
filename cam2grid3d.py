@@ -1,10 +1,10 @@
 import cv2
 import torch
 import numpy as np
-import pyvista as pv
+import open3d as o3d
 from torchvision import transforms
 from scipy.spatial import Delaunay
-import heapq
+import matplotlib.cm as cm
 
 class DepthEstimator:
     def __init__(self):
@@ -28,87 +28,107 @@ class DepthEstimator:
         
         return depth_map
 
-def create_voxel_grid(depth_map, scale_factor=0.25, voxel_depth=50):
-    # Downsample depth image
+def create_voxel_grid(depth_map, scale_factor=0.25, voxel_depth=20):
     depth_image_downsampled = cv2.resize(depth_map, (0, 0), fx=scale_factor, fy=scale_factor)
-    
-    # Normalize depth image
     depth_image_downsampled = depth_image_downsampled.astype(np.float32)
     depth_image_downsampled = depth_image_downsampled / np.max(depth_image_downsampled)
     
-    # Define voxel grid size
     voxel_grid_size = (depth_image_downsampled.shape[0], depth_image_downsampled.shape[1], voxel_depth)
-    
-    # Initialize voxel occupancy
     voxel_occupancy = np.zeros(voxel_grid_size, dtype=bool)
     
-    # Populate voxel grid
     for i in range(depth_image_downsampled.shape[0]):
         for j in range(depth_image_downsampled.shape[1]):
             depth_value = depth_image_downsampled[i, j]
             z = int(depth_value * (voxel_grid_size[2] - 1))
             voxel_occupancy[i, j, z] = True
     
-    # Convert the voxel occupancy to a list of coordinates
     voxel_coords = np.argwhere(voxel_occupancy)
+    depth_values = depth_image_downsampled[voxel_coords[:, 0], voxel_coords[:, 1]]
     
-    return voxel_coords
+    return voxel_coords, depth_values
 
-def build_adjacency_list(vertices, faces):
-    adjacency_list = {i: set() for i in range(len(vertices))}
-    for face in faces:
-        for i in range(len(face)):
-            for j in range(i + 1, len(face)):
-                adjacency_list[face[i]].add(face[j])
-                adjacency_list[face[j]].add(face[i])
-    return adjacency_list
+def create_mesh_from_voxel_coords(voxel_coords, depth_values):
+    if len(voxel_coords) < 4:
+        return o3d.geometry.TriangleMesh()
+    
+    triangulation = Delaunay(voxel_coords[:, :2])
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(voxel_coords)
+    mesh.triangles = o3d.utility.Vector3iVector(triangulation.simplices)
+    
+    # Normalize depth values for color mapping
+    normalized_depth = (depth_values - np.min(depth_values)) / (np.max(depth_values) - np.min(depth_values))
+    
+    # Map normalized depth values to colors
+    cmap = cm.get_cmap('plasma')  # You can choose other colormaps like 'viridis', 'inferno', etc.
+    colors = cmap(normalized_depth)[:, :3]  # RGB colors (ignore alpha channel)
+    
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+    
+    return mesh
 
 def main():
     depth_estimator = DepthEstimator()
     cap = cv2.VideoCapture(0)
-    target_size = (256, 256)  # Resize input to 256x256 for depth estimation
+    target_size = (256, 256)
 
-    # Create a PyVista plotter
-    plotter = pv.Plotter()
-        # Custom mouse interaction
-    plotter.enable_trackball_style()  # Enable trackball style as a base
+    # Create Open3D visualizer window
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name='3D Mesh Viewer')
     
-    plotter.show(interactive=True, interactive_update=True)
+    # Create an initial empty mesh
+    mesh = o3d.geometry.TriangleMesh()
+    vis.add_geometry(mesh)
+
+    # Access the view control
+    ctr = vis.get_view_control()
     
+    # Define initial camera parameters
+    front = [0, 0, -1]  # Looking towards negative z-axis
+    up = [0, 1, 0]  # Up direction
+
+    # Set initial view
+    ctr.set_front(front)
+    ctr.set_up(up)
+    ctr.set_lookat([0, 0, 0])  # Look at the origin
+    ctr.set_zoom(0.8)
+
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame")
             break
         
-        # Resize frame for depth estimation
+        # Flip the frame both horizontally and vertically
+        frame = cv2.flip(frame, -1)  # -1 means flipping both horizontally and vertically
+        
         small_frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
-        
-        # Get depth map
         depth_map = depth_estimator.predict(small_frame)
+        voxel_coords, depth_values = create_voxel_grid(depth_map)
+        new_mesh = create_mesh_from_voxel_coords(voxel_coords, depth_values)
         
-        # Create voxel grid point cloud
-        voxel_coords = create_voxel_grid(depth_map)
+        if len(voxel_coords) > 0:
+            vis.remove_geometry(mesh)
+            mesh = new_mesh
+            vis.add_geometry(mesh)
+            vis.update_geometry(mesh)
         
-        # Perform Delaunay triangulation to create a mesh
-        triangulation = Delaunay(voxel_coords[:, :2])  # Delaunay triangulation for the xy-plane
-        mesh = pv.PolyData(voxel_coords)
-        mesh.faces = np.hstack([[3] + list(face) for face in triangulation.simplices])  # Convert simplices to faces
-
-        # Add the mesh to the plotter
-        plotter.clear()
-        plotter.add_mesh(mesh, color='blue', opacity=0.25)
-
-        # Display the original frame and resized depth image
-        cv2.imshow('Original Video Feed', frame)
-        depth_image_display = cv2.resize((depth_map * 255).astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-        cv2.imshow('Depth Image', depth_image_display)
+        # Rotate camera by 180 degrees around the vertical axis (i.e., up direction)
+        front_rotated = [-x for x in front]  # Flip the front vector to achieve 180-degree rotation
+        ctr.set_front(front_rotated)
         
+        vis.poll_events()
+        vis.update_renderer()
+        
+        if not vis.poll_events():
+            break
+        # Exit loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-    
+
     cap.release()
     cv2.destroyAllWindows()
+    vis.destroy_window()
 
 if __name__ == "__main__":
     main()
